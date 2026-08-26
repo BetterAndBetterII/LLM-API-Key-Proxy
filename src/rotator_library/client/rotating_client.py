@@ -426,7 +426,7 @@ class RotatingClient:
 
         return await self._executor.execute(context)
 
-    def aembedding(
+    async def aembedding(
         self,
         request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
@@ -449,13 +449,14 @@ class RotatingClient:
             provider=provider,
             kwargs=kwargs,
             streaming=False,
+            request_type="embedding",
             credentials=self.all_credentials.get(provider, []),
             deadline=time.time() + self.global_timeout,
             request=request,
             pre_request_callback=pre_request_callback,
         )
 
-        return self._executor.execute(context)
+        return await self._executor.execute(context)
 
     def token_count(self, **kwargs) -> int:
         """Calculate token count for text or messages."""

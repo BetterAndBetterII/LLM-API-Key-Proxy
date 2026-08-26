@@ -1824,6 +1824,176 @@ class GeminiCliProvider(
             raise last_error
         raise ValueError("No fallback models available")
 
+    @staticmethod
+    def _normalize_embedding_inputs(raw_input: Any) -> List[str]:
+        if raw_input is None:
+            return []
+        if isinstance(raw_input, str):
+            return [raw_input]
+        texts: List[str] = []
+        for item in raw_input:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                texts.append(item)
+            else:
+                texts.append(str(item))
+        return texts
+
+    @staticmethod
+    def _parse_embed_content_response(
+        data: Dict[str, Any],
+    ) -> Tuple[List[float], int]:
+        payload = data.get("response", data)
+        embedding = payload.get("embedding")
+        values = None
+        if isinstance(embedding, dict):
+            values = embedding.get("values")
+        elif isinstance(embedding, list):
+            values = embedding
+        if values is None:
+            embeddings = payload.get("embeddings")
+            if isinstance(embeddings, list) and embeddings:
+                first = embeddings[0]
+                if isinstance(first, dict):
+                    values = first.get("values")
+                elif isinstance(first, list):
+                    values = first
+        if not values:
+            raise ValueError(
+                f"Gemini CLI embedContent returned no embedding values: {data}"
+            )
+
+        usage = payload.get("usageMetadata") or data.get("usageMetadata") or {}
+        tokens = (
+            usage.get("promptTokenCount")
+            or usage.get("totalTokenCount")
+            or usage.get("totalTokens")
+            or 0
+        )
+        return list(values), int(tokens)
+
+    async def aembedding(
+        self, client: httpx.AsyncClient, **kwargs
+    ) -> litellm.EmbeddingResponse:
+        model = kwargs["model"]
+        credential_path = kwargs.pop("credential_identifier")
+        kwargs.pop("transaction_context", None)
+
+        auth_header = await self.get_auth_header(credential_path)
+        project_id = self.project_id_cache.get(credential_path)
+        if not project_id:
+            access_token = auth_header["Authorization"].split(" ")[1]
+            project_id = await self._discover_project_id(
+                credential_path, access_token, kwargs.get("litellm_params", {})
+            )
+
+        model_name = model.split("/")[-1]
+        texts = self._normalize_embedding_inputs(kwargs.get("input"))
+
+        headers = auth_header.copy()
+        headers.update(self._get_gemini_cli_request_headers(model_name))
+
+        data_items: List[Dict[str, Any]] = []
+        total_tokens = 0
+        for index, text in enumerate(texts):
+            request_body: Dict[str, Any] = {
+                "content": {"parts": [{"text": text}]},
+            }
+            dimensions = kwargs.get("dimensions")
+            if dimensions:
+                request_body["outputDimensionality"] = dimensions
+            task_type = kwargs.get("task_type") or kwargs.get("taskType")
+            if task_type:
+                request_body["taskType"] = task_type
+
+            request_payload = {
+                "model": model_name,
+                "project": project_id,
+                "request": request_body,
+            }
+
+            last_endpoint_error = None
+            response_data = None
+            for endpoint_idx, base_endpoint in enumerate(GEMINI_CLI_ENDPOINT_FALLBACKS):
+                url = f"{base_endpoint}:embedContent"
+                try:
+                    response = await client.post(
+                        url,
+                        headers=headers,
+                        json=request_payload,
+                        timeout=TimeoutConfig.non_streaming(),
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                    last_endpoint_error = None
+                    break
+                except httpx.HTTPStatusError as e:
+                    error_body = None
+                    if e.response is not None:
+                        try:
+                            error_body = e.response.text
+                        except Exception:
+                            pass
+                    if e.response is not None and e.response.status_code == 429:
+                        retry_after = extract_retry_after_from_body(error_body)
+                        retry_info = (
+                            f" (retry after {retry_after}s)" if retry_after else ""
+                        )
+                        error_msg = f"Gemini CLI rate limit exceeded{retry_info}"
+                        if error_body:
+                            error_msg = f"{error_msg} | {error_body}"
+                        raise RateLimitError(
+                            message=error_msg,
+                            llm_provider="gemini_cli",
+                            model=model,
+                            response=e.response,
+                        )
+                    if (
+                        e.response is not None
+                        and e.response.status_code >= 500
+                        and endpoint_idx < len(GEMINI_CLI_ENDPOINT_FALLBACKS) - 1
+                    ):
+                        last_endpoint_error = e
+                        lib_logger.warning(
+                            f"embedContent: endpoint {base_endpoint} returned {e.response.status_code}, trying fallback"
+                        )
+                        continue
+                    raise
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    last_endpoint_error = e
+                    if endpoint_idx < len(GEMINI_CLI_ENDPOINT_FALLBACKS) - 1:
+                        lib_logger.warning(
+                            f"embedContent: connection error to {base_endpoint}, trying fallback"
+                        )
+                        continue
+                    raise
+
+            if response_data is None:
+                if last_endpoint_error:
+                    raise last_endpoint_error
+                raise ValueError("Gemini CLI embedContent failed with no response")
+
+            values, tokens = self._parse_embed_content_response(response_data)
+            total_tokens += tokens
+            data_items.append(
+                {
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": values,
+                }
+            )
+
+        return litellm.EmbeddingResponse(
+            model=model,
+            data=data_items,
+            usage=litellm.Usage(
+                prompt_tokens=total_tokens,
+                completion_tokens=0,
+                total_tokens=total_tokens,
+            ),
+        )
+
     async def count_tokens(
         self,
         client: httpx.AsyncClient,
