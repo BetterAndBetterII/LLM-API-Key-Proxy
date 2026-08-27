@@ -17,6 +17,7 @@ if str(SRC) not in sys.path:
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.client.rotating_client import RotatingClient
 from rotator_library.core.types import FilterResult, RequestContext
+from litellm.exceptions import RateLimitError
 from rotator_library.providers.gemini_cli_provider import GeminiCliProvider
 
 
@@ -235,6 +236,75 @@ class TestGeminiCliProviderEmbedding(unittest.IsolatedAsyncioTestCase):
         values = first["embedding"] if isinstance(first, dict) else first.embedding
         self.assertEqual(list(values), [0.4, 0.5])
         self.assertEqual(response.usage.prompt_tokens, 2)
+
+    async def test_aembedding_maps_dimensions_and_input_type(self):
+        provider = GeminiCliProvider()
+        provider.project_id_cache["cred.json"] = "test-project"
+        provider.get_auth_header = AsyncMock(
+            return_value={"Authorization": "Bearer fake-token"}
+        )
+
+        posted = {}
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"embedding": {"values": [0.1, 0.2]}}
+
+        async def fake_post(url, **kwargs):
+            posted["json"] = kwargs.get("json")
+            return _FakeResponse()
+
+        client = MagicMock()
+        client.post = fake_post
+
+        await provider.aembedding(
+            client,
+            model="gemini_cli/gemini-embedding-001",
+            input=["doc"],
+            dimensions=768,
+            input_type="RETRIEVAL_DOCUMENT",
+            credential_identifier="cred.json",
+        )
+
+        req = posted["json"]["request"]
+        self.assertEqual(req["outputDimensionality"], 768)
+        self.assertEqual(req["taskType"], "RETRIEVAL_DOCUMENT")
+
+    async def test_aembedding_429_raises_rate_limit_error(self):
+        import httpx
+
+        provider = GeminiCliProvider()
+        provider.project_id_cache["cred.json"] = "test-project"
+        provider.get_auth_header = AsyncMock(
+            return_value={"Authorization": "Bearer fake-token"}
+        )
+
+        class _FakeResponse:
+            status_code = 429
+            text = '{"error":"rate limited"}'
+
+            def raise_for_status(self):
+                raise httpx.HTTPStatusError(
+                    "429",
+                    request=MagicMock(),
+                    response=self,
+                )
+
+        client = MagicMock()
+        client.post = AsyncMock(return_value=_FakeResponse())
+
+        with self.assertRaises(RateLimitError):
+            await provider.aembedding(
+                client,
+                model="gemini_cli/gemini-embedding-001",
+                input=["x"],
+                credential_identifier="cred.json",
+            )
+
+
 
 
 if __name__ == "__main__":

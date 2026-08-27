@@ -1903,7 +1903,12 @@ class GeminiCliProvider(
             dimensions = kwargs.get("dimensions")
             if dimensions:
                 request_body["outputDimensionality"] = dimensions
-            task_type = kwargs.get("task_type") or kwargs.get("taskType")
+            # HTTP EmbeddingRequest exposes input_type; accept task_type/taskType too.
+            task_type = (
+                kwargs.get("task_type")
+                or kwargs.get("taskType")
+                or kwargs.get("input_type")
+            )
             if task_type:
                 request_body["taskType"] = task_type
 
